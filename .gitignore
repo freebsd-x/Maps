@@ -1,0 +1,19 @@
+# Build artefacts
+build/
+*.o
+*.a
+*.so
+*.spv
+*.d
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Core dumps
+*.core
+
+# macOS
+.DS_Store
