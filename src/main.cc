@@ -168,14 +168,15 @@ static fs::path tilePath(int z, int x, int y) {
 }
 
 static bool tileOnDisk(int z, int x, int y) {
-    return fs::is_regular_file(tilePath(z, x, y));
+    std::error_code ec;   // no throwing: the sandbox can't even stat the cache
+    return fs::is_regular_file(tilePath(z, x, y), ec);
 }
 
 // ── PNG decode ────────────────────────────────────────────────────────────────
 
 // Decode a PNG file to RGBA (256×256×4). Returns empty on failure.
-static TilePixels decodePng(const std::string& path) {
-    FILE* fp = std::fopen(path.c_str(), "rb");
+// Decodes from an open stream and closes it.
+static TilePixels decodePngStream(FILE* fp) {
     if (!fp) return {};
 
     uint8_t sig[8];
@@ -241,6 +242,15 @@ static TilePixels decodePng(const std::string& path) {
         return scaled;
     }
     return pixels;
+}
+
+static TilePixels decodePng(const std::string& path) {
+    return decodePngStream(std::fopen(path.c_str(), "rb"));
+}
+
+// A tile straight from the downloaded bytes (when it can't be cached on disk).
+static TilePixels decodePngMemory(std::string& body) {
+    return decodePngStream(::fmemopen(body.data(), body.size(), "rb"));
 }
 
 // ── Memory cache ──────────────────────────────────────────────────────────────
@@ -310,16 +320,21 @@ static void fetchTile(TileKey key) {
         return;
     }
 
-    // Save to disk
+    // Save to the disk cache if we can — inside the Capsicum sandbox the
+    // cache directory can't be created; the throwing create_directories()
+    // used to abort the whole app from this thread. Decode from memory then.
     auto path = tilePath(key.z, key.x, key.y);
-    fs::create_directories(path.parent_path());
-    {
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    bool cached = false;
+    if (!ec) {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
         f.write(body.data(), static_cast<std::streamsize>(body.size()));
+        cached = static_cast<bool>(f);
     }
 
     // Decode PNG
-    auto pixels = decodePng(path.string());
+    auto pixels = cached ? decodePng(path.string()) : decodePngMemory(body);
 
     {
         std::lock_guard<std::mutex> lk(g_cache_mutex);
