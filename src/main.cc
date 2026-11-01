@@ -307,7 +307,7 @@ static bool httpGet(const std::string& url, std::string& body) {
 // ── Tile fetching ─────────────────────────────────────────────────────────────
 
 // Fetch tile from OSM, save to disk cache, decode, insert into memory cache.
-// Runs in a background thread; calls g_redraw when done.
+// Runs in a background thread; posts the cache insert + g_redraw to the UI thread.
 static void fetchTile(TileKey key) {
     // Build OSM URL
     char url[128];
@@ -336,16 +336,20 @@ static void fetchTile(TileKey key) {
     // Decode PNG
     auto pixels = cached ? decodePng(path.string()) : decodePngMemory(body);
 
-    {
-        std::lock_guard<std::mutex> lk(g_cache_mutex);
-        if (!pixels.empty()) insertCache(key, std::move(pixels));
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_pending_mutex);
-        g_pending.erase(key);
-    }
-
-    if (g_redraw) g_redraw();
+    // The cache insert (which can evict a tile the frame is drawing) and the
+    // redraw run on the UI thread, never alongside the frame.
+    auto shared = std::make_shared<TilePixels>(std::move(pixels));
+    XApplication::post([key, shared] {
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mutex);
+            if (!shared->empty()) insertCache(key, std::move(*shared));
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_pending_mutex);
+            g_pending.erase(key);
+        }
+        if (g_redraw) g_redraw();
+    });
 }
 
 // Get tile pixels (from memory → disk → network). Returns nullptr if unavailable.
@@ -405,17 +409,23 @@ static void blitPlaceholder(std::vector<uint8_t>& canvas, int cw, int ch,
     int y0 = std::max(0, py);
     int x1 = std::min(cw, px + kTileSize);
     int y1 = std::min(ch, py + kTileSize);
+    // The tile loop includes a row/column just past the edges; the border
+    // below used to write row y0 of such an off-canvas tile past the end of
+    // the canvas buffer (heap corruption that crashed Maps intermittently).
+    if (x0 >= x1 || y0 >= y1) return;
     for (int r = y0; r < y1; ++r) {
         for (int c = x0; c < x1; ++c) {
             uint8_t* p = canvas.data() + (r * cw + c) * 4;
             p[0] = 0x25; p[1] = 0x26; p[2] = 0x27; p[3] = 0xFF;
         }
     }
-    // 1-pixel border
+    // 1-pixel border, on the tile's own top/bottom rows when they're visible
     for (int c = x0; c < x1; ++c) {
-        uint8_t* t = canvas.data() + (y0 * cw + c) * 4;
-        t[0] = t[1] = t[2] = 0x44; t[3] = 0xFF;
-        if (y1 - 1 >= 0) {
+        if (py >= 0) {
+            uint8_t* t = canvas.data() + (py * cw + c) * 4;
+            t[0] = t[1] = t[2] = 0x44; t[3] = 0xFF;
+        }
+        if (py + kTileSize <= ch) {
             uint8_t* b = canvas.data() + ((y1 - 1) * cw + c) * 4;
             b[0] = b[1] = b[2] = 0x44; b[3] = 0xFF;
         }
@@ -745,39 +755,46 @@ int main(int argc, char** argv) {
                 char url[512];
                 std::snprintf(url, sizeof(url), kNominatimUrlFmt,
                               urlEncode(q).c_str());
+                // Only the network work happens on this thread: every change to
+                // the map state or the widgets is posted to the UI thread
+                // (changing them here raced the frame and corrupted the heap).
                 std::string body;
                 if (!httpGet(url, body)) {
-                    try { status_lbl->setText("Network error"); } catch (...) {}
+                    XApplication::post([=] { status_lbl->setText("Network error"); });
                     return;
                 }
                 double rlat, rlon;
                 std::string rname;
                 if (!parseNominatim(body, rlat, rlon, rname)) {
-                    try { status_lbl->setText("Not found: " + q); } catch (...) {}
+                    XApplication::post([=] { status_lbl->setText("Not found: " + q); });
                     return;
                 }
-                // Fly-to: animate in kAnimSteps increments
-                double from_lat = *cur_lat, from_lon = *cur_lon;
+                // Fly-to: animate in kAnimSteps increments (each step on the UI thread)
+                auto from = std::make_shared<std::pair<double, double>>();
+                XApplication::post([=] { *from = {*cur_lat, *cur_lon}; });
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
                 for (int i = 1; i <= static_cast<int>(kAnimSteps); ++i) {
                     double t = i / kAnimSteps;
                     // Ease-in-out cubic
                     double ease = t < 0.5 ? 4 * t * t * t
                                           : 1 - std::pow(-2 * t + 2, 3) / 2;
-                    *cur_lat = from_lat + (rlat - from_lat) * ease;
-                    *cur_lon = from_lon + (rlon - from_lon) * ease;
-                    try { g_redraw(); } catch (...) {}
+                    XApplication::post([=] {
+                        *cur_lat = from->first + (rlat - from->first) * ease;
+                        *cur_lon = from->second + (rlon - from->second) * ease;
+                        g_redraw();
+                    });
                     std::this_thread::sleep_for(std::chrono::milliseconds(30));
                 }
-                // Drop a POI at the result
-                Poi poi;
-                poi.lat = rlat; poi.lon = rlon; poi.name = rname;
-                poi.r = 80; poi.g = 160; poi.b = 220;
-                g_pois.push_back(poi);
-                try {
+                XApplication::post([=] {
+                    // Drop a POI at the result
+                    Poi poi;
+                    poi.lat = rlat; poi.lon = rlon; poi.name = rname;
+                    poi.r = 80; poi.g = 160; poi.b = 220;
+                    g_pois.push_back(poi);
                     status_lbl->setText(rname);
                     zoom_label->setText("z" + std::to_string(*cur_zoom));
                     g_redraw();
-                } catch (...) {}
+                });
             }).detach();
         });
     search_btn->setFixedSize(72.0f, 30.0f);
@@ -851,19 +868,19 @@ int main(int argc, char** argv) {
                     std::string body;
                     double lat, lon; std::string city;
                     if (httpGet(kIpApiUrl, body) && parseIpApi(body, lat, lon, city)) {
-                        *gps_lat = lat; *gps_lon = lon; *gps_fix = true;
-                        bool pinned = false;
-                        for (auto& p : g_pois)
-                            if (p.name == "GPS") { p.lat = lat; p.lon = lon; pinned = true; break; }
-                        if (!pinned) g_pois.push_back({lat, lon, "GPS", 60, 200, 80});
-                        *cur_lat = lat; *cur_lon = lon;   // recentre
-                        try {
+                        XApplication::post([=] {
+                            *gps_lat = lat; *gps_lon = lon; *gps_fix = true;
+                            bool pinned = false;
+                            for (auto& p : g_pois)
+                                if (p.name == "GPS") { p.lat = lat; p.lon = lon; pinned = true; break; }
+                            if (!pinned) g_pois.push_back({lat, lon, "GPS", 60, 200, 80});
+                            *cur_lat = lat; *cur_lon = lon;   // recentre
                             status_lbl->setText(city.empty() ? std::string("My location (IP)")
                                                              : ("My location: " + city));
                             g_redraw();
-                        } catch (...) {}
+                        });
                     } else {
-                        try { status_lbl->setText("IP location unavailable"); } catch (...) {}
+                        XApplication::post([=] { status_lbl->setText("IP location unavailable"); });
                     }
                 }).detach();
             });
@@ -956,14 +973,14 @@ int main(int argc, char** argv) {
                     double rlat, rlon;
                     std::string rname;
                     if (!parseNominatim(body, rlat, rlon, rname)) return;
-                    *cur_lat = rlat;
-                    *cur_lon = rlon;
-                    g_pois.push_back({rlat, rlon, rname, 80, 160, 220});
-                    try {
+                    XApplication::post([=] {
+                        *cur_lat = rlat;
+                        *cur_lon = rlon;
+                        g_pois.push_back({rlat, rlon, rname, 80, 160, 220});
                         status_lbl->setText(rname);
                         zoom_label->setText("z" + std::to_string(*cur_zoom));
                         g_redraw();
-                    } catch (...) {}
+                    });
                 }).detach();
             }
         });
