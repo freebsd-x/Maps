@@ -5,7 +5,8 @@
 //   Map area (flex):    GestureDetectorWidget wrapping a composited ImageWidget
 //
 // Features:
-//   • OSM slippy tiles fetched via libcurl (imaps → https://tile.openstreetmap.org)
+//   • OSM slippy tiles fetched through com.freebsdx.Fetch (Maps is sandboxed;
+//     the xfetch daemon does the HTTPS and caches tiles on disk)
 //   • Disk cache at ~/.freebsdx-maps-cache/{z}/{x}/{y}.png
 //   • In-memory tile cache (up to kMemCacheMax tiles)
 //   • Composite RGBA buffer: blit tiles → single ImageWidget (PDFViewer pattern)
@@ -21,7 +22,7 @@
 #include "xkit/application.h"
 #include "xkit/xbus_client.h"
 #include "shared/protocol.h"
-#include <curl/curl.h>
+#include "xkit/fetch.h"
 #include <png.h>
 #include <memory>
 #include <string>
@@ -63,7 +64,6 @@ static const char* kTileUrlFmt     = "https://tile.openstreetmap.org/%d/%d/%d.pn
 static const char* kNominatimUrlFmt =
     "https://nominatim.openstreetmap.org/search?q=%s&format=json&limit=1&"
     "accept-language=en";
-static const char* kUserAgent = "FreeBSD-X Maps/1.0 (com.freebsdx.maps; libcurl)";
 // IP-based geolocation fallback (free, no key, HTTP-only on the free tier). Only
 // used when the GPS service has no fix AND the user has opted in — see
 // ipGeoEnabled(). Sending the client IP to a third party is the inherent cost of
@@ -280,28 +280,16 @@ static void insertCache(TileKey key, TilePixels pixels) {
     g_cache_map[key] = g_lru_list.begin();
 }
 
-// ── libcurl helpers ───────────────────────────────────────────────────────────
+// ── Network ──────────────────────────────────────────────────────────────────
 
-static size_t curlWrite(char* ptr, size_t sz, size_t nmemb, std::string* s) {
-    s->append(ptr, sz * nmemb);
-    return sz * nmemb;
-}
-
-// Fetch a URL into a byte buffer, returns false on error.
+// Fetch a URL into a byte buffer (on a worker thread), returns false on error.
+// Goes through com.freebsdx.Fetch: inside the Capsicum sandbox Maps can't open
+// a socket, and the hosts it may reach are allowlisted for it.
 static bool httpGet(const std::string& url, std::string& body) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
-    curl_easy_setopt(curl, CURLOPT_USERAGENT,     kUserAgent);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWrite);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &body);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,        15L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    CURLcode rc = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    return rc == CURLE_OK;
+    auto r = fbx::xkit::fetchBlocking(url);
+    if (!r.ok()) return false;
+    body = std::move(r.body);
+    return true;
 }
 
 // ── Tile fetching ─────────────────────────────────────────────────────────────
@@ -633,7 +621,6 @@ static std::string urlEncode(const std::string& s) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     // ── State ─────────────────────────────────────────────────────────────────
     auto cur_lat     = std::make_shared<double>(kDefaultLat);
@@ -917,6 +904,9 @@ int main(int argc, char** argv) {
         gesture,
     });
     root->setGap(0.0f);
+    // Stretch: the map area has no width of its own (its image arrives later),
+    // so with the default Start alignment it laid out 0 px wide — a black map.
+    root->setCrossAxisAlignment(CrossAxisAlignment::Stretch);
     root->setBackgroundColor(Color{0.0f, 0.0f, 0.0f, 1.0f});
 
     // ── Pre-load from argv[1]: treat as "lat,lon" or "place name" ─────────────
@@ -986,7 +976,7 @@ int main(int argc, char** argv) {
         });
 
     // Leave without exit-time teardown: detached tile / search threads may be
-    // mid-request inside libcurl/OpenSSL, and running their atexit cleanup
+    // waiting on a fetch, and running their atexit cleanup
     // under them crashed the app as its window closed. Nothing here needs it.
     std::_Exit(rc);
 }
