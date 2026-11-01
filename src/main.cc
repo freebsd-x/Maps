@@ -906,7 +906,7 @@ int main(int argc, char** argv) {
     std::string preload_query;
     if (argc >= 2) preload_query = argv[1];
 
-    return XApplication::Run(root, "/tmp/freebsdx.sock", /*sandboxed=*/false,
+    const int rc = XApplication::Run(root, "/tmp/freebsdx.sock", /*sandboxed=*/false,
                              /*is_shell=*/false,
         [=](XBusClient& xbus) {
             XApplication::setTitle("Maps");
@@ -967,4 +967,9 @@ int main(int argc, char** argv) {
                 }).detach();
             }
         });
+
+    // Leave without exit-time teardown: detached tile / search threads may be
+    // mid-request inside libcurl/OpenSSL, and running their atexit cleanup
+    // under them crashed the app as its window closed. Nothing here needs it.
+    std::_Exit(rc);
 }
